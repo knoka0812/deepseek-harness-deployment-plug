@@ -1,0 +1,26 @@
+# public-access — full no-auth public deployment overlay for `dsh web`.
+#
+# This is a PATCH OVERLAY, not a plugin tree: apply it with `dsh web --patch`
+# as one more sibling patch list over the web profile (dsh-base + dsh-web-app).
+# A patch replaces the targeted row's whole `config`, so each row below
+# restates every key it owns.
+#
+#   SECURITY: this grants any caller who can reach the public address the
+#   same configuration-plane and host-side actions as loopback. It is not
+#   authentication. Only use it when you accept anonymous public access.
+
+# 1) Bind all interfaces instead of 127.0.0.1. Port stays CLI-driven
+#    (--port 7860) and defaults to 7860 for this overlay.
+- id: webserver
+  config:
+    host: '0.0.0.0'
+    port: !!js ctx.webStartup.port ?? 7860
+
+# 2) Let a declared trusted authority reach the privileged method set
+#    (settings.*, credentials.*, agentPreset.read/copy/openDocument/remove,
+#    host.pickDirectory/openPath, llm.discoverModels) instead of pinning them
+#    to loopback. The outer DNS-rebinding/cross-site fence still applies.
+- id: connection
+  config:
+    trustedHosts: !!js ctx.webRuntime.trustedHosts
+    pinPrivilegedToLoopback: false

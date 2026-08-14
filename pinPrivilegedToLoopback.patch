@@ -1,0 +1,96 @@
+diff --git a/packages/client/connection/src/index.ts b/packages/client/connection/src/index.ts
+index 3508491..1ae62e2 100644
+--- a/packages/client/connection/src/index.ts
++++ b/packages/client/connection/src/index.ts
+@@ -59,11 +59,24 @@ export interface ConnectionConfig {
+   trustedHosts?: string[]
+   /** Maximum buffered JSON body for every `/api` request. */
+   maxRequestBodyBytes?: number
++  /**
++   * Whether the privileged method set stays loopback-only even on a
++   * trusted-host deployment. Defaults to `true` (the safe default): the
++   * settings, credential, native-dialog, and agent-preset-authoring methods
++   * then additionally pass the trust fence with an empty trust list, which
++   * pins them to loopback regardless of `trustedHosts`. Set `false` to let a
++   * declared `trustedHosts` authority reach those methods too — the outer
++   * DNS-rebinding/cross-site fence still applies, but this is NOT
++   * authentication, so only do it when you accept anonymous public access to
++   * the configuration plane and host-side actions.
++   */
++  pinPrivilegedToLoopback?: boolean
+ }
+ 
+ export const Config: z<ConnectionConfig> = z.object({
+   trustedHosts: z.array(String).default([]),
+   maxRequestBodyBytes: z.natural().min(1).default(DEFAULT_MAX_REQUEST_BODY_BYTES),
++  pinPrivilegedToLoopback: z.boolean().default(true),
+ })
+ 
+ /**
+@@ -131,6 +144,7 @@ export function apply(ctx: Context, config?: ConnectionConfig): void {
+   // The Loader resolves schema defaults; hand-built test contexts may pass none.
+   const trustedHosts = config?.trustedHosts ?? []
+   const maxRequestBodyBytes = config?.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES
++  const pinPrivilegedToLoopback = config?.pinPrivilegedToLoopback ?? true
+   // Config boundary: a malformed entry fails the load loudly here rather than
+   // silently authorizing its hostname prefix at request time.
+   for (const entry of trustedHosts) assertTrustedAuthority(entry)
+@@ -142,7 +156,8 @@ export function apply(ctx: Context, config?: ConnectionConfig): void {
+       const method = pathname.startsWith(`${API_PATH}/`)
+         ? pathname.slice(API_PATH.length + 1)
+         : undefined
+-      if (method !== undefined
++      if (pinPrivilegedToLoopback
++        && method !== undefined
+         && PRIVILEGED_METHODS.has(method)
+         && !isTrustedApiRequest(request, [])) {
+         return new Response('forbidden', { status: 403 })
+diff --git a/packages/client/connection/tests/node-half.host.spec.ts b/packages/client/connection/tests/node-half.host.spec.ts
+index 0b30ce6..c305dde 100644
+--- a/packages/client/connection/tests/node-half.host.spec.ts
++++ b/packages/client/connection/tests/node-half.host.spec.ts
+@@ -74,7 +74,7 @@ function fakeResponse(): { response: ServerResponse; state: { status?: number; b
+   return { response, state }
+ }
+ 
+-async function mounted(config?: { trustedHosts?: string[] }): Promise<{
++async function mounted(config?: { trustedHosts?: string[]; pinPrivilegedToLoopback?: boolean }): Promise<{
+   routes: WebRoute[]
+   upgrades: WebUpgradeRoute[]
+   dispose: () => Promise<void>
+@@ -192,6 +192,35 @@ describe('connection node half', () => {
+     await dispose()
+   })
+ 
++  it('lets a declared trusted authority reach privileged methods when the loopback pin is off', async () => {
++    const { routes, dispose } = await mounted({ trustedHosts: ['harness.example'], pinPrivilegedToLoopback: false })
++    // With the pin disabled, the same declared authority reaches the
++    // privileged set too: the carrier-level 404 from the empty proxy proves
++    // the request crossed the trust fence instead of being 403ed.
++    for (const method of [
++      'host.pickDirectory', 'host.openPath',
++      'settings.describe', 'settings.openDocument', 'settings.update', 'settings.replace', 'settings.mutate',
++      'credentials.describe', 'credentials.set', 'credentials.unset',
++      'llm.discoverModels',
++      'agentPreset.read', 'agentPreset.copy', 'agentPreset.openDocument', 'agentPreset.remove',
++    ]) {
++      const response = fakeResponse()
++      await routes[0]!.handler(
++        fakeRequest({ host: 'harness.example' }, `${API_PATH}/${method}`),
++        response.response,
++      )
++      expect(response.state.status).toBe(404)
++    }
++    // An untrusted authority still 403s: the outer fence is untouched.
++    const denied = fakeResponse()
++    await routes[0]!.handler(
++      fakeRequest({ host: 'other.example' }, `${API_PATH}/settings.describe`),
++      denied.response,
++    )
++    expect(denied.state.status).toBe(403)
++    await dispose()
++  })
++
+   it('passes loopback and declared-authority requests through to the bridge', async () => {
+     const { routes, dispose } = await mounted({ trustedHosts: ['harness.example:3080', '192.168.1.5'] })
+     // Loopback, no browser markers (curl shape): the fence passes; the carrier

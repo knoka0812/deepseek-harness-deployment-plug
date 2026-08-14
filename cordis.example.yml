@@ -1,0 +1,12 @@
+# public-access — full no-auth public deployment overlay for `dsh web`.
+# Patch overlay applied via `dsh web --patch`.
+
+- id: webserver
+  config:
+    host: '0.0.0.0'
+    port: 7086
+
+- id: connection
+  config:
+    trustedHosts: !!js ctx.webRuntime.trustedHosts
+    pinPrivilegedToLoopback: false
