@@ -1,0 +1,25 @@
+# Full anonymous remote administration overlay for `dsh web`.
+# SECURITY: trustedHosts is not authentication. Protect the public entry with
+# real authentication and source restrictions whenever possible.
+
+- id: webserver
+  config:
+    host: '0.0.0.0'
+    port: !!js ctx.webStartup.port ?? 7860
+
+# Allow trusted remote authorities to call privileged RPCs; the outer request
+# trust fence remains active.
+- id: connection
+  config:
+    trustedHosts: !!js ctx.webRuntime.trustedHosts
+    pinPrivilegedToLoopback: false
+
+# Expose every namespace already registered by the Host settings provider.
+- id: api-gateway
+  config:
+    exposeAllSettingsNamespaces: true
+
+# Use Host-backed settings instead of memory mode for remote browser pages.
+- id: ui-settings
+  config:
+    allowRemoteSettingsPersistence: true

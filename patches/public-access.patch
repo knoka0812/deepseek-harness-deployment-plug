@@ -1,0 +1,537 @@
+diff --git a/packages/client/connection/src/index.ts b/packages/client/connection/src/index.ts
+index 35084918e8..72550fede3 100644
+--- a/packages/client/connection/src/index.ts
++++ b/packages/client/connection/src/index.ts
+@@ -57,26 +57,43 @@ export interface ConnectionConfig {
+    * that is not a bare, canonical authority fails the plugin load.
+    */
+   trustedHosts?: string[]
++  /**
++   * Keep privileged host, settings, credential, model-discovery, and preset
++   * methods restricted to loopback even when the authority is trusted.
++   * Defaults to true. Setting this to false lets every authority in
++   * `trustedHosts` reach those methods; because trusted hosts are a
++   * DNS-rebinding fence rather than authentication, disable the pin only when
++   * the deployment knowingly accepts anonymous remote administration or
++   * another access-control layer protects it.
++   */
++  pinPrivilegedToLoopback?: boolean
+   /** Maximum buffered JSON body for every `/api` request. */
+   maxRequestBodyBytes?: number
+ }
+ 
+ export const Config: z<ConnectionConfig> = z.object({
+   trustedHosts: z.array(String).default([]),
++  pinPrivilegedToLoopback: z.boolean().default(true),
+   maxRequestBodyBytes: z.natural().min(1).default(DEFAULT_MAX_REQUEST_BODY_BYTES),
+ })
+ 
+ /**
+- * Methods gated to loopback even on a trusted-host deployment. Native dialogs
+- * act on the host machine; the settings and credential domains mutate the
++ * Methods gated to loopback by default, even on a trusted-host deployment.
++ * `pinPrivilegedToLoopback` controls this security-sensitive second fence: it
++ * defaults to enabled and is skipped only when the option is explicitly
++ * false. Native dialogs act on the host machine; the settings and credential
++ * domains mutate the
+  * user's configuration and secret store, and READING them is equally
+  * privileged — `settings.describe` returns every exposed namespace's
+  * configuration and `credentials.describe` reports whether an arbitrary
+  * environment-variable name is configured and where from, which is
+  * reconnaissance no anonymous caller should have. `trustedHosts` is a
+- * DNS-rebinding fence, explicitly not authentication, so the whole
+- * configuration plane stays loopback-same-origin until a real authentication
+- * layer exists. `llm.discoverModels` belongs to that plane on both counts: it
++ * DNS-rebinding fence, explicitly not authentication, so by default the whole
++ * configuration plane stays loopback-same-origin. Explicitly disabling the
++ * pin delegates access to the declared trusted-host outer fence and is
++ * intended only for deployments accepting anonymous remote administration or
++ * providing another access-control layer. `llm.discoverModels` belongs to
++ * that plane on both counts: it
+  * carries a draft credential, and it makes the HOST issue a GET to a URL the
+  * caller chose and reports back the status or the parsed body — an anonymous
+  * LAN caller would have a probe for whatever the host can reach and the
+@@ -122,14 +139,17 @@ const PRIVILEGED_METHODS = new Set([
+  * Mounts the API gateway under the browser transport prefix. Every request on
+  * the prefix passes the browser-trust fence first (DNS-rebinding and
+  * cross-site defense — [api-request-trust](./api-request-trust.ts));
+- * privileged methods additionally pass it with an empty trust list, which
+- * pins them to loopback.
++ * by default, privileged methods additionally pass it with an empty trust
++ * list, which pins them to loopback. This security-sensitive second check is
++ * configurable and defaults to enabled; it is skipped only when
++ * `pinPrivilegedToLoopback` is explicitly false.
+  * @param ctx - Host plugin context.
+  * @param config - resolved plugin config (schema defaults applied).
+  */
+ export function apply(ctx: Context, config?: ConnectionConfig): void {
+   // The Loader resolves schema defaults; hand-built test contexts may pass none.
+   const trustedHosts = config?.trustedHosts ?? []
++  const pinPrivilegedToLoopback = config?.pinPrivilegedToLoopback ?? true
+   const maxRequestBodyBytes = config?.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES
+   // Config boundary: a malformed entry fails the load loudly here rather than
+   // silently authorizing its hostname prefix at request time.
+@@ -143,6 +163,7 @@ export function apply(ctx: Context, config?: ConnectionConfig): void {
+         ? pathname.slice(API_PATH.length + 1)
+         : undefined
+       if (method !== undefined
++        && pinPrivilegedToLoopback
+         && PRIVILEGED_METHODS.has(method)
+         && !isTrustedApiRequest(request, [])) {
+         return new Response('forbidden', { status: 403 })
+diff --git a/packages/client/connection/tests/node-half.host.spec.ts b/packages/client/connection/tests/node-half.host.spec.ts
+index 0b30ce6520..0ee24ad4d9 100644
+--- a/packages/client/connection/tests/node-half.host.spec.ts
++++ b/packages/client/connection/tests/node-half.host.spec.ts
+@@ -74,7 +74,10 @@ function fakeResponse(): { response: ServerResponse; state: { status?: number; b
+   return { response, state }
+ }
+ 
+-async function mounted(config?: { trustedHosts?: string[] }): Promise<{
++async function mounted(config?: {
++  trustedHosts?: string[]
++  pinPrivilegedToLoopback?: boolean
++}): Promise<{
+   routes: WebRoute[]
+   upgrades: WebUpgradeRoute[]
+   dispose: () => Promise<void>
+@@ -192,6 +195,36 @@ describe('connection node half', () => {
+     await dispose()
+   })
+ 
++  it('lets a declared trusted authority reach privileged methods when the loopback pin is off', async () => {
++    const { routes, dispose } = await mounted({
++      trustedHosts: ['harness.example'],
++      pinPrivilegedToLoopback: false,
++    })
++    for (const method of [
++      'host.pickDirectory', 'host.openPath',
++      'settings.describe', 'settings.openDocument', 'settings.update', 'settings.replace', 'settings.mutate',
++      'credentials.describe', 'credentials.set', 'credentials.unset',
++      'llm.discoverModels',
++      'agentPreset.read', 'agentPreset.copy', 'agentPreset.openDocument', 'agentPreset.remove',
++    ]) {
++      const allowed = fakeResponse()
++      await routes[0]!.handler(
++        fakeRequest({ host: 'harness.example' }, `${API_PATH}/${method}`),
++        allowed.response,
++      )
++      expect([method, allowed.state.status]).toEqual([method, 404])
++    }
++
++    const denied = fakeResponse()
++    await routes[0]!.handler(
++      fakeRequest({ host: 'other.example' }, `${API_PATH}/settings.describe`),
++      denied.response,
++    )
++    expect(denied.state.status).toBe(403)
++    expect(denied.state.body).toBe('forbidden')
++    await dispose()
++  })
++
+   it('passes loopback and declared-authority requests through to the bridge', async () => {
+     const { routes, dispose } = await mounted({ trustedHosts: ['harness.example:3080', '192.168.1.5'] })
+     // Loopback, no browser markers (curl shape): the fence passes; the carrier
+diff --git a/packages/client/ui-settings/package.json b/packages/client/ui-settings/package.json
+index e97d297c00..2c6a679dbf 100644
+--- a/packages/client/ui-settings/package.json
++++ b/packages/client/ui-settings/package.json
+@@ -44,6 +44,9 @@
+     "watch": "tsdown --watch"
+   },
+   "license": "MIT",
++  "dependencies": {
++    "@deepseek-ai/schemastery": "workspace:^"
++  },
+   "peerDependencies": {
+     "@deepseek-ai/cordis": "workspace:^",
+     "@deepseek-ai/dsh-api-remotes": "workspace:^",
+diff --git a/packages/client/ui-settings/src/client/index.ts b/packages/client/ui-settings/src/client/index.ts
+index 2ace9e56b1..981617243d 100644
+--- a/packages/client/ui-settings/src/client/index.ts
++++ b/packages/client/ui-settings/src/client/index.ts
+@@ -9,13 +9,15 @@
+  * through ui-layout and ui-theme. Export discipline: packages/client/AGENTS.md.
+  */
+ import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+-import { SettingsScopeBinder } from './settings-scope.ts'
++import { SettingsScopeBinder, type SettingsScopeBinderConfig } from './settings-scope.ts'
+ 
+ export type {
+   SettingsGeneralItemOwnerProps, SettingsHeaderOwnerProps, SettingsOnboardingOwnerProps,
+   SettingsPluginsTabOwnerProps, SettingsSectionOwnerProps, SettingsTriggerOwnerProps,
+ } from './contract/slots.ts'
+-export { SettingsScopeController, SettingsScopeBinder } from './settings-scope.ts'
++export {
++  Config, SettingsScopeController, SettingsScopeBinder, type SettingsScopeBinderConfig,
++} from './settings-scope.ts'
+ 
+ /**
+  * Required services: none. The transport is resolved per caller through
+@@ -29,7 +31,8 @@ export const inject = []
+  * Constructing the service in this plugin's fiber keeps its traced methods
+  * bound to each consuming plugin's context.
+  * @param ctx - client root context.
++ * @param config - resolved settings transport policy.
+  */
+-export function apply(ctx: ClientContext): void {
+-  new SettingsScopeBinder(ctx)
++export function apply(ctx: ClientContext, config: SettingsScopeBinderConfig = {}): void {
++  new SettingsScopeBinder(ctx, config)
+ }
+diff --git a/packages/client/ui-settings/src/client/settings-scope.ts b/packages/client/ui-settings/src/client/settings-scope.ts
+index 4668c4924b..920e5d1c57 100644
+--- a/packages/client/ui-settings/src/client/settings-scope.ts
++++ b/packages/client/ui-settings/src/client/settings-scope.ts
+@@ -7,6 +7,7 @@
+ 
+ import { Service } from '@deepseek-ai/cordis'
+ import type { Context } from '@deepseek-ai/cordis'
++import z from '@deepseek-ai/schemastery'
+ import type {
+   ConnectionHandle, IApiClient, SettingsNamespaceView, SettingsPathOpView,
+ } from '@deepseek-ai/dsh-api-remotes/client'
+@@ -49,7 +50,7 @@ export class SettingsScopeController<T> implements SettingsScope<T> {
+   /**
+    * @param api - settings wire face.
+    * @param spec - namespace identity and optional narrowing decoder.
+-   * @param persistence - remote browsers remain process-local because settings RPCs are loopback-only.
++   * @param persistence - selects Host-backed transport or process-local memory behavior.
+    */
+   constructor(
+     private readonly api: SettingsFace,
+@@ -217,6 +218,23 @@ declare module '@deepseek-ai/cordis' {
+   }
+ }
+ 
++/** Settings-scope transport policy. */
++export interface SettingsScopeBinderConfig {
++  /**
++   * Permit non-loopback browsers to use Host-backed settings reads, refreshes,
++   * and writes.
++   * Defaults to false because a trusted remote authority is not authentication:
++   * enabling this exposes the Host settings surface to remote browser clients
++   * and should only be used behind an access-control layer or where anonymous
++   * remote administration is explicitly accepted.
++   */
++  allowRemoteSettingsPersistence?: boolean
++}
++
++export const Config: z<SettingsScopeBinderConfig> = z.object({
++  allowRemoteSettingsPersistence: z.boolean().default(false),
++})
++
+ /**
+  * The settings domain's base service. Features that own a preference reach the
+  * settings transport through this service rather than a shared function: the
+@@ -225,11 +243,17 @@ declare module '@deepseek-ai/cordis' {
+  * (`packages/client/tsdown.client.ts`).
+  */
+ export class SettingsScopeBinder extends Service {
++  static Config = Config
++
++  private readonly allowRemoteSettingsPersistence: boolean
++
+   /**
+    * @param ctx - the providing plugin's context.
++   * @param config - validated remote persistence policy.
+    */
+-  constructor(ctx: Context) {
++  constructor(ctx: Context, config: SettingsScopeBinderConfig = {}) {
+     super(ctx, 'settingsScope')
++    this.allowRemoteSettingsPersistence = config.allowRemoteSettingsPersistence === true
+   }
+ 
+   /**
+@@ -248,7 +272,7 @@ export class SettingsScopeBinder extends Service {
+     const controller = new SettingsScopeController<T>(
+       connection.api,
+       spec,
+-      connection.isLoopback ? 'host' : 'memory',
++      connection.isLoopback || this.allowRemoteSettingsPersistence ? 'host' : 'memory',
+     )
+     ctx.effect(() => {
+       const refresh = (namespace?: string): void => {
+diff --git a/packages/client/ui-settings/tests/plugin.client.spec.ts b/packages/client/ui-settings/tests/plugin.client.spec.ts
+index 1643e9580f..b9726f7003 100644
+--- a/packages/client/ui-settings/tests/plugin.client.spec.ts
++++ b/packages/client/ui-settings/tests/plugin.client.spec.ts
+@@ -4,13 +4,21 @@
+  * service retires with its fiber.
+  */
+ import { Context } from '@deepseek-ai/cordis'
+-import { describe, expect, it } from 'vitest'
+-import { apply, inject, SettingsScopeBinder } from '../src/client/index.ts'
++import z from '@deepseek-ai/schemastery'
++import { describe, expect, it, vi } from 'vitest'
++import { TestRemote } from '@deepseek-ai/dsh-client-test-runtime'
++import type { SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
++import * as SettingsPlugin from '../src/client/index.ts'
++
++import { SettingsScopeBinder } from '../src/client/index.ts'
++interface UiTestSettings {
++  preference: 'light' | 'dark'
++}
+ 
+ /** Boot the browser half over a bare root context; it injects nothing. */
+ function bench() {
+   const ctx = new Context()
+-  return { ctx, fiber: ctx.plugin({ inject: [...inject], apply }) }
++  return { ctx, fiber: ctx.plugin(SettingsPlugin) }
+ }
+ 
+ describe('settings domain base plugin', () => {
+@@ -25,5 +33,52 @@ describe('settings domain base plugin', () => {
+     await fiber.await()
+     await fiber.dispose()
+     expect(ctx.get('settingsScope')).toBeUndefined()
++
++  })
++  it('passes remote persistence config through the production plugin entry', async () => {
++    const describeCall = vi.fn().mockResolvedValueOnce({
++      rpcId: 'plugin-scope-1',
++      result: {
++        ok: true,
++        value: {
++          writable: true,
++          hasDocument: true,
++          namespaces: [{
++            ns: 'ui-test',
++            schema: z.object({
++              preference: z.union(['light', 'dark']).default('light'),
++            }).toJSON(),
++            value: { preference: 'dark' },
++            applies: 'live',
++            secrets: [],
++            revision: 1,
++          }],
++        },
++      },
++    })
++    const ctx = new Context()
++    ctx.provide('connection', {
++      api: { settings: { describe: describeCall } },
++      isLoopback: false,
++    } as never)
++    new TestRemote(ctx)
++    const settingsFiber = ctx.plugin(SettingsPlugin, { allowRemoteSettingsPersistence: true })
++    await settingsFiber.await()
++    let scope!: SettingsScope<UiTestSettings>
++    const consumerFiber = ctx.plugin({
++      inject: ['connection', 'remote', 'settingsScope'],
++      apply: (plugin: Context) => {
++        scope = plugin.settingsScope.bind<UiTestSettings>({ namespace: 'ui-test' })
++      },
++    })
++    await consumerFiber.await()
++    await vi.waitFor(() => { expect(describeCall).toHaveBeenCalledOnce() })
++    await vi.waitFor(() => {
++      expect(scope.getSnapshot()).toMatchObject({
++        status: 'ready', mode: 'host', value: { preference: 'dark' },
++      })
++    })
++    await consumerFiber.dispose()
++    await settingsFiber.dispose()
+   })
+ })
+diff --git a/packages/client/ui-settings/tests/settings-scope.client.spec.ts b/packages/client/ui-settings/tests/settings-scope.client.spec.ts
+index 429002028a..5ecaf3690c 100644
+--- a/packages/client/ui-settings/tests/settings-scope.client.spec.ts
++++ b/packages/client/ui-settings/tests/settings-scope.client.spec.ts
+@@ -423,4 +423,36 @@ describe('SettingsScopeBinder.bind', () => {
+     await fiber.dispose()
+     expect(describeCall).not.toHaveBeenCalled()
+   })
++
++  it('binds a remote browser to Host settings when remote persistence is enabled', async () => {
++    const describeCall = vi.fn().mockResolvedValueOnce(described({ preference: 'dark' }, 1))
++    const ctx = new Context()
++    ctx.provide('connection', {
++      api: { settings: { describe: describeCall } },
++      isLoopback: false,
++    } as never)
++    let scope!: SettingsScope<UiTestSettings>
++    new TestRemote(ctx)
++    const settingsFiber = ctx.plugin(SettingsScopeBinder, { allowRemoteSettingsPersistence: true })
++    await settingsFiber.await()
++    const fiber = ctx.plugin({
++      inject: ['connection', 'remote', 'settingsScope'],
++      apply: (plugin: Context) => {
++        scope = plugin.settingsScope.bind<UiTestSettings>({ namespace: 'ui-test' })
++      },
++    })
++    await fiber.await()
++    await vi.waitFor(() => { expect(describeCall).toHaveBeenCalledOnce() })
++    await vi.waitFor(() => {
++      expect(scope.getSnapshot()).toEqual({
++        status: 'ready',
++        value: { preference: 'dark' },
++        revision: 1,
++        writable: true,
++        mode: 'host',
++      })
++    })
++    await fiber.dispose()
++    await settingsFiber.dispose()
++  })
+ })
+diff --git a/packages/host/apiproxy/src/api-proxy.ts b/packages/host/apiproxy/src/api-proxy.ts
+index bda99362b6..333bd67f60 100644
+--- a/packages/host/apiproxy/src/api-proxy.ts
++++ b/packages/host/apiproxy/src/api-proxy.ts
+@@ -651,6 +651,12 @@ export interface ApiProxyDefaults {
+   saveDefaultModelSelection?: (selection: ModelSelection) => Promise<void>
+   /** Default project directory for new sessions whose create request carries no cwd. */
+   cwd: string
++  /**
++   * Expose every settings namespace registered with the Host provider instead
++   * of applying the model-provider, Web, and product allowlists. This does not
++   * register namespaces or relax provider schema validation. Defaults to false.
++   */
++  exposeAllSettingsNamespaces?: boolean
+   /** Native open-with-default-application; injectable for carrier tests. */
+   openPath?: (path: string, signal: AbortSignal) => Promise<void>
+   /** Native text-editor handoff; injectable for settings-document tests. */
+@@ -2006,7 +2012,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
+       // in the exposed set either, so naming the real fault costs no ground.
+       return rejected(error)
+     }
+-    if (!exposedNamespaces().has(ns)) return notExposed(request, ns)
++    if (defaults.exposeAllSettingsNamespaces !== true && !exposedNamespaces().has(ns)) return notExposed(request, ns)
+     try {
+       if (mode === 'update') await settings.update(branded, section, expectedRevision)
+       else if (mode === 'replace') await settings.replace(branded, section, expectedRevision)
+@@ -3261,12 +3267,13 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
+       describe(request) {
+         const settings = ctx.get('settings')
+         if (settings === undefined) return Promise.resolve(err(request, settingsAbsent()))
+-        const exposed = exposedNamespaces()
++        const descriptors = settings.describe({ redactSecrets: true })
++        const exposed = defaults.exposeAllSettingsNamespaces === true ? undefined : exposedNamespaces()
+         return Promise.resolve(ok(request, {
+           writable: settings.writable,
+           hasDocument: settings.documentPath !== undefined,
+-          namespaces: settings.describe({ redactSecrets: true })
+-            .filter(descriptor => exposed.has(String(descriptor.ns)))
++          namespaces: descriptors
++            .filter(descriptor => exposed === undefined || exposed.has(String(descriptor.ns)))
+             .map(namespaceView),
+         }))
+       },
+diff --git a/packages/host/apiproxy/src/index.ts b/packages/host/apiproxy/src/index.ts
+index ac6c770801..f689eb791c 100644
+--- a/packages/host/apiproxy/src/index.ts
++++ b/packages/host/apiproxy/src/index.ts
+@@ -39,6 +39,14 @@ declare module '@deepseek-ai/cordis' {
+ 
+ /** Gateway plugin configuration. */
+ export interface Config {
++  /**
++   * Expose every namespace registered with the Host settings provider through
++   * the configuration API. By default only model-provider, Web, and explicit
++   * product namespaces are exposed. Registration and schema validation still
++   * govern all writes.
++   * @default false
++   */
++  exposeAllSettingsNamespaces?: boolean
+   /**
+    * Whether this deployment can hand paths to a native desktop opener —
+    * the `hasDocument` capability the agent-preset roster reports. Absent,
+@@ -73,6 +81,7 @@ export class ApiProxyService extends Service implements ApiProxy {
+   ]
+ 
+   static Config: z<Config> = z.object({
++    exposeAllSettingsNamespaces: z.boolean().default(false),
+     nativeOpen: z.boolean(),
+     sessionExportCompressionLevel: z.number().step(1).min(0).max(9)
+       .default(DEFAULT_SESSION_LOG_COMPRESSION_LEVEL) as z<SessionLogCompressionLevel>,
+@@ -99,6 +108,7 @@ export class ApiProxyService extends Service implements ApiProxy {
+       defaultModelSelection: () => ctx.agentDefaultModel.currentSelection(),
+       saveDefaultModelSelection: selection => ctx.agentDefaultModel.saveSelection(selection),
+       cwd: process.cwd(),
++      exposeAllSettingsNamespaces: config.exposeAllSettingsNamespaces === true,
+       ...config.nativeOpen === undefined ? {} : { canOpenPath: () => config.nativeOpen as boolean },
+       ...(config.sessionExportCompressionLevel === undefined
+         ? {}
+diff --git a/packages/host/apiproxy/tests/api-proxy-config.spec.ts b/packages/host/apiproxy/tests/api-proxy-config.spec.ts
+index d4ba7b374b..be486b2df4 100644
+--- a/packages/host/apiproxy/tests/api-proxy-config.spec.ts
++++ b/packages/host/apiproxy/tests/api-proxy-config.spec.ts
+@@ -408,6 +408,30 @@ describe('settings domain', () => {
+     expect(ctx.settings.describe().find(d => String(d.ns) === 'some-other-plugin')?.value).toEqual({})
+   })
+ 
++  it('exposes every registered namespace when configured without accepting unregistered namespaces', async () => {
++    const ctx = await harness()
++    ctx.settings.register(settingsNamespace('third-party-plugin'), z.object({
++      enabled: z.boolean().default(false),
++    }))
++    const api = createApiProxy(ctx, { ...DEFAULTS, exposeAllSettingsNamespaces: true })
++
++    const described = expectOk(await api.settings.describe(request({})))
++    expect(described.namespaces.map(view => view.ns)).toContain('third-party-plugin')
++
++    const updated = expectOk(await api.settings.update(request({
++      ns: 'third-party-plugin',
++      patch: { enabled: true },
++    })))
++    expect(updated.value).toEqual({ enabled: true })
++
++    const result = (await api.settings.update(request({
++      ns: 'not-registered',
++      patch: { enabled: true },
++    }))).result
++    expect(result.ok).toBe(false)
++    if (!result.ok) expect(result.error.code).toBe('settings-rejected')
++  })
++
+   it('serves product preference namespaces without invalidating the model catalog', async () => {
+     const ctx = await harness()
+     ctx.settings.register(settingsNamespace('ui-onboarding'), z.object({ welcomeNoticeVersion: z.string() }))
+diff --git a/packages/host/apiproxy/tests/session-export.spec.ts b/packages/host/apiproxy/tests/session-export.spec.ts
+index 5b5fcaa216..4cb77ef3f5 100644
+--- a/packages/host/apiproxy/tests/session-export.spec.ts
++++ b/packages/host/apiproxy/tests/session-export.spec.ts
+@@ -128,13 +128,14 @@ async function responseBytes(response: Response): Promise<Uint8Array> {
+ describe('session export compression config', () => {
+   it('defaults to level 6 and rejects values outside the integer 0-9 range', () => {
+     expect(ApiProxyService.Config({})).toEqual({
++      exposeAllSettingsNamespaces: false,
+       sessionExportCompressionLevel: 6,
+       coldBlankProbeMaxBytes: 1024,
+     })
+     expect(ApiProxyService.Config({ sessionExportCompressionLevel: 0 }))
+-      .toEqual({ sessionExportCompressionLevel: 0, coldBlankProbeMaxBytes: 1024 })
++      .toEqual({ exposeAllSettingsNamespaces: false, sessionExportCompressionLevel: 0, coldBlankProbeMaxBytes: 1024 })
+     expect(ApiProxyService.Config({ sessionExportCompressionLevel: 9 }))
+-      .toEqual({ sessionExportCompressionLevel: 9, coldBlankProbeMaxBytes: 1024 })
++      .toEqual({ exposeAllSettingsNamespaces: false, sessionExportCompressionLevel: 9, coldBlankProbeMaxBytes: 1024 })
+     for (const value of [-1, 10, 1.5]) {
+       expect(() => ApiProxyService.Config({ sessionExportCompressionLevel: value } as never)).toThrow()
+     }
+@@ -144,9 +145,9 @@ describe('session export compression config', () => {
+ describe('cold blank probe config', () => {
+   it('accepts a per-Session byte bound including zero and rejects invalid bounds', () => {
+     expect(ApiProxyService.Config({ coldBlankProbeMaxBytes: 0 }))
+-      .toEqual({ sessionExportCompressionLevel: 6, coldBlankProbeMaxBytes: 0 })
++      .toEqual({ exposeAllSettingsNamespaces: false, sessionExportCompressionLevel: 6, coldBlankProbeMaxBytes: 0 })
+     expect(ApiProxyService.Config({ coldBlankProbeMaxBytes: 2048 }))
+-      .toEqual({ sessionExportCompressionLevel: 6, coldBlankProbeMaxBytes: 2048 })
++      .toEqual({ exposeAllSettingsNamespaces: false, sessionExportCompressionLevel: 6, coldBlankProbeMaxBytes: 2048 })
+     for (const value of [-1, 1.5]) {
+       expect(() => ApiProxyService.Config({ coldBlankProbeMaxBytes: value })).toThrow()
+     }
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 1490a0f9f7..72288d799a 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -2406,6 +2406,9 @@ importers:
+       '@deepseek-ai/dsh-client-connection':
+         specifier: workspace:^
+         version: link:../connection
++      '@deepseek-ai/schemastery':
++        specifier: link:../../../vendor/schemastery
++        version: link:../../../vendor/schemastery
+     devDependencies:
+       '@deepseek-ai/cordis':
+         specifier: workspace:^
