@@ -209,16 +209,16 @@ index 4668c4924b..920e5d1c57 100644
 +  /**
 +   * Permit non-loopback browsers to use Host-backed settings reads, refreshes,
 +   * and writes.
-+   * Defaults to false because a trusted remote authority is not authentication:
-+   * enabling this exposes the Host settings surface to remote browser clients
-+   * and should only be used behind an access-control layer or where anonymous
-+   * remote administration is explicitly accepted.
++   * Defaults to true in this public-access patch because the client-side plugin
++   * does not receive Host overlay config through the boot manifest. Apply this
++   * patch only when anonymous remote administration is knowingly accepted or
++   * another access-control layer protects the entry.
 +   */
 +  allowRemoteSettingsPersistence?: boolean
 +}
 +
 +export const Config: z<SettingsScopeBinderConfig> = z.object({
-+  allowRemoteSettingsPersistence: z.boolean().default(false),
++  allowRemoteSettingsPersistence: z.boolean().default(true),
 +})
 +
  /**
@@ -335,9 +335,18 @@ index 1643e9580f..b9726f7003 100644
    })
  })
 diff --git a/packages/client/ui-settings/tests/settings-scope.client.spec.ts b/packages/client/ui-settings/tests/settings-scope.client.spec.ts
-index 429002028a..5ecaf3690c 100644
+index 429002028a..c553940960 100644
 --- a/packages/client/ui-settings/tests/settings-scope.client.spec.ts
 +++ b/packages/client/ui-settings/tests/settings-scope.client.spec.ts
+@@ -411,7 +411,7 @@ describe('SettingsScopeBinder.bind', () => {
+     } as never)
+     let scope!: SettingsScope<UiTestSettings>
+     new TestRemote(ctx)
+-    await ctx.plugin(SettingsScopeBinder).await()
++    await ctx.plugin(SettingsScopeBinder, { allowRemoteSettingsPersistence: false }).await()
+     const fiber = ctx.plugin({
+       inject: ['connection', 'remote', 'settingsScope'],
+       apply: (plugin: Context) => {
 @@ -423,4 +423,36 @@ describe('SettingsScopeBinder.bind', () => {
      await fiber.dispose()
      expect(describeCall).not.toHaveBeenCalled()

@@ -5,7 +5,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PATCH="$ROOT/patches/public-access.patch"
 OVERLAY="$ROOT/config/cordis.public-access.yml"
 SUPPORTED_COMMIT=47f943859bef60e4160492346772ded9b24f765a
-EXPECTED_PATCH_SHA256=014e8caddf3219da54bd04aae1c750630c2a9ae600ea6b03b7d72a8c48e8ac4e
+EXPECTED_PATCH_SHA256=00c49c14460c581a8695f3053fe39c3693b6fc754f6edcb1e627fddb1ec225ef
 
 if [[ $# -ne 1 ]]; then
   echo "usage: $0 /path/to/deepseek-harness" >&2
@@ -113,8 +113,8 @@ if ! patch_section_contains packages/host/apiproxy/src/index.ts exposeAllSetting
   echo "error: API proxy source diffs do not contain exposeAllSettingsNamespaces" >&2
   exit 1
 fi
-if ! patch_section_contains packages/client/ui-settings/src/client/settings-scope.ts allowRemoteSettingsPersistence; then
-  echo "error: settings scope source diff does not contain allowRemoteSettingsPersistence" >&2
+if ! patch_section_contains packages/client/ui-settings/src/client/settings-scope.ts 'allowRemoteSettingsPersistence: z.boolean().default(true)'; then
+  echo "error: settings scope source diff must default browser remote persistence to true" >&2
   exit 1
 fi
 if ! patch_section_contains packages/client/ui-settings/src/client/index.ts SettingsScopeBinderConfig \

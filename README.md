@@ -61,10 +61,12 @@ exposeAllSettingsNamespaces
 allowRemoteSettingsPersistence
 ```
 
-- 默认 `false`：远程页面继续使用内存设置模式。
+- 默认 `false`（上游行为）：远程页面继续使用内存设置模式。
 - 设为 `true`：远程页面通过 Host API 读取、刷新和保存设置。
 
-三个开关默认都保持上游安全行为，只有使用本仓库提供的 Cordis 覆盖层时才会显式开启。
+由于 DSH 的 boot manifest 目前不会把 Cordis 覆盖层配置带到浏览器端，`ui-settings` 客户端插件接收不到覆盖层里的 `allowRemoteSettingsPersistence: true`。因此本补丁同时把客户端 `SettingsScopeBinder` 的默认值改为 `true`，确保公网部署下远程页面直接走 Host 设置持久化。
+
+前两个开关默认保持上游安全行为；第三个开关在客户端被本补丁显式默认开启，以解决 boot manifest 不透传配置的问题。
 
 ## 支持版本
 
@@ -295,8 +297,8 @@ sha256sum -c SHA256SUMS
 补丁身份：
 
 ```text
-SHA256: 014e8caddf3219da54bd04aae1c750630c2a9ae600ea6b03b7d72a8c48e8ac4e
-stable patch ID: ad3debde77fd08aaf9520e9b620b0d9128d8aeba
+SHA256: 00c49c14460c581a8695f3053fe39c3693b6fc754f6edcb1e627fddb1ec225ef
+stable patch ID: 4698e67e76e2cbdee4cd4e5bd55c2db5c8cbb491
 ```
 
 ## 进一步阅读
