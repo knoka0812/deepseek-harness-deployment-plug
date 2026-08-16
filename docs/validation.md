@@ -9,8 +9,8 @@
 | DeepSeek Harness HEAD | `47f943859bef60e4160492346772ded9b24f765a` |
 | Node.js | `v24.19.0` |
 | pnpm | `11.7.0` |
-| patch SHA256 | `014e8caddf3219da54bd04aae1c750630c2a9ae600ea6b03b7d72a8c48e8ac4e` |
-| stable patch ID | `ad3debde77fd08aaf9520e9b620b0d9128d8aeba` |
+| patch SHA256 | `00c49c14460c581a8695f3053fe39c3693b6fc754f6edcb1e627fddb1ec225ef` |
+| stable patch ID | `4698e67e76e2cbdee4cd4e5bd55c2db5c8cbb491` |
 | patch manifest | 精确 12 个批准路径 |
 
 补丁 12 路径为：
