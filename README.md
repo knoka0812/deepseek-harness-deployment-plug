@@ -1,105 +1,254 @@
-# DeepSeek Harness 公网部署插件
+# DeepSeek Harness Public Access Patch
 
-把 DeepSeek Harness Web UI 以**完全公开、无登录认证**的方式监听 `0.0.0.0`，并放开「设置 / Agent 预设 / 凭据 / 宿主目录」等特权接口的回环限制。
+本仓库提供一个源码补丁和一个 Cordis 覆盖层，用于在明确接受匿名远程管理风险的前提下，让声明为可信 authority 的远程浏览器使用完整的 DeepSeek Harness Web UI；本仓库不负责安装、认证、反向代理或进程管理。
 
-> **安全警告**：本插件让任何能访问公网地址的人都能读写设置、管理凭据、打开宿主目录/文件，并可能获得命令执行能力。`trustedHosts` 只是 DNS-rebinding / 跨站防护，**不是认证**。仅在明确接受匿名公网访问时使用。正式环境请配合来源 IP 限制、反向代理认证和非特权用户。
+> **匿名公网访问安全警告：任何能够访问可信公开 authority 的人，都可能读写设置，检查凭据是否已配置、来源和可写状态，设置或取消设置凭据，调用宿主特权能力，并通过 Harness 的正常工具获得文件访问或命令执行能力。接口不会返回已存储的凭据值。`trustedHosts` 不是身份认证。请优先使用 HTTPS、反向代理认证和来源 IP 限制。**
 
-## 文件说明
+## 根因与控制
 
-| 文件 | 作用 |
+| 控制 | 根因 | 安全默认值 | 公共访问覆盖层 |
+| --- | --- | --- | --- |
+| `pinPrivilegedToLoopback` | 特权 RPC 在外层可信请求检查后仍有第二层回环限制 | `true`，特权 RPC 仅回环可用 | `false`，已声明可信 authority 可访问 |
+| `exposeAllSettingsNamespaces` | API 代理只暴露内置 allowlist 中的设置命名空间 | `false`，继续执行 allowlist | `true`，暴露所有已注册命名空间 |
+| `allowRemoteSettingsPersistence` | 非回环浏览器固定使用内存设置模式 | `false`，远程页面不持久化到 Host | `true`，远程页面使用 Host 设置模式 |
+
+三个选项都保持上游安全默认值；只有应用本仓库覆盖层时才显式开启匿名远程管理行为。
+
+## 支持版本
+
+仅支持 DeepSeek Harness commit `47f943859bef60e4160492346772ded9b24f765a`。
+
+批准补丁的 SHA256 是 `014e8caddf3219da54bd04aae1c750630c2a9ae600ea6b03b7d72a8c48e8ac4e`，stable patch ID 是 `ad3debde77fd08aaf9520e9b620b0d9128d8aeba`。
+
+## 目录
+
+| 路径 | 内容 |
 | --- | --- |
-| `cordis.yml` | `dsh web --patch` 覆盖层：监听 `0.0.0.0:7860`，`pinPrivilegedToLoopback: false` |
-| `cordis.example.yml` | 示例：监听 `0.0.0.0:7086`（配合端口映射场景） |
-| `pinPrivilegedToLoopback.patch` | 给 `client-connection` 加配置开关的源码补丁（一次性，默认仍安全） |
-| `dsh-start.sh` | 启动脚本示例（nohup 后台运行 + 就绪探测） |
+| `patches/public-access.patch` | 三项上游源码改动及聚焦测试 |
+| `config/cordis.public-access.yml` | 监听全部接口并启用三项公共访问控制的覆盖层 |
+| `scripts/verify.sh` | 只读检查补丁适用状态与配置完整性 |
+| `docs/architecture.md` | 请求和设置数据流 |
+| `docs/security.md` | 威胁模型与部署缓解措施 |
+| `docs/troubleshooting.md` | 按症状定位故障层 |
+| `docs/version-compatibility.md` | 支持版本与补丁刷新流程 |
+| `docs/validation.md` | 支持 commit 上的最终验证证据与复现方法 |
+| `docs/superpowers/specs/` | 保留的设计文档 |
+| `docs/superpowers/plans/` | 保留的实施计划 |
+| `LICENSE` | Apache License 2.0 |
+| [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 上游派生补丁内容的 MIT 许可声明 |
+| `SHA256SUMS` | 除自身外全部交付文件的 SHA256 内容清单 |
 
-## 为什么需要一个源码补丁
-
-特权接口（`settings.*`、`credentials.*`、`agentPreset.read/copy/openDocument/remove`、`host.pickDirectory/openPath`、`llm.discoverModels`）的二次回环限制原本硬编码在 `packages/client/connection/src/index.ts` 里，没有配置项。本仓库的 `pinPrivilegedToLoopback.patch` 给该插件新增 `pinPrivilegedToLoopback` 开关：
-
-- 默认 `true`：保持上游安全行为（特权方法仍回环锁定）。
-- 设 `false`：声明的 `trustedHosts` authority 也能访问这些方法，外层 Host/Origin/Sec-Fetch-Site 信任栅栏**仍然保留**，未声明的 Host 仍返回 403。
-
-`0.0.0.0` 监听本身**不需要改源码**：`webserver` 插件的 schema 本来就接受 `0.0.0.0`，补丁层直接覆盖 `webserver.host` 即可（不必传 `--host 0.0.0.0`，也不用改 `startup.ts`）。
-
-## 部署步骤
-
-### 1. 克隆源码并应用补丁
+## 手动应用
 
 ```bash
-git clone --depth 1 https://github.com/deepseek-ai/deepseek-harness.git /data/deepseek-harness
-cd /data/deepseek-harness
-git apply /path/to/pinPrivilegedToLoopback.patch
-```
-
-### 2. 安装 Node.js 与 pnpm
-
-```bash
-# 用独立 conda 环境，避免污染系统 Node
-/data/miniconda/bin/conda create -y -p /data/miniconda/envs/deepseek-harness \
-  --override-channels -c conda-forge 'nodejs>=24,<25'
-
-export PATH=/data/miniconda/envs/deepseek-harness/bin:$PATH
-corepack enable
-corepack prepare pnpm@11.7.0 --activate
-```
-
-### 3. 安装依赖并构建
-
-```bash
-export PATH=/data/miniconda/envs/deepseek-harness/bin:$PATH
+git clone https://github.com/deepseek-ai/deepseek-harness.git /data/deepseek-harness
+git -C /data/deepseek-harness checkout 47f943859bef60e4160492346772ded9b24f765a
+git -C /data/deepseek-harness apply --check /path/to/public-access-kit/patches/public-access.patch
+git -C /data/deepseek-harness apply /path/to/public-access-kit/patches/public-access.patch
 pnpm --dir /data/deepseek-harness install --frozen-lockfile
 pnpm --dir /data/deepseek-harness run build
 ```
 
-### 4.（可选）构建 Landlock 沙箱 runner
+`git apply --check` 失败时不要强行应用，先查看[版本兼容性](docs/version-compatibility.md)。
 
-```bash
-sudo apt-get update
-sudo apt-get install -y --no-install-recommends musl-tools
-pnpm --dir /data/deepseek-harness/native/landlock-run run build:native
-```
-
-### 5. 准备覆盖层与启动脚本
-
-把 `cordis.yml`（或按端口映射改好的 `cordis.example.yml`）放到 `/data/deepseek-harness-runtime/cordis.yml`，把 `dsh-start.sh` 里的 `PUBLIC_AUTHORITY` 改成浏览器地址栏里的 `IP/域名[:端口]`。
-
-### 6. 启动
+## 运行
 
 ```bash
 dsh web \
-  --patch /data/deepseek-harness-runtime/cordis.yml \
+  --patch /path/to/public-access-kit/config/cordis.public-access.yml \
   --trusted-host PUBLIC_AUTHORITY \
   --port 7860
 ```
 
-`--trusted-host` 只填裸 authority（不带 `http://`、路径或斜杠），可重复多个：
+`PUBLIC_AUTHORITY` 必须是浏览器地址栏可见的裸 authority，例如 `HOSTNAME` 或 `HOSTNAME:7860`，不能带协议、路径或末尾斜杠。
+
+## 只读验证
 
 ```bash
-dsh web --patch ./cordis.yml --trusted-host harness.example.com 203.0.113.10:7860
+/path/to/public-access-kit/scripts/verify.sh /data/deepseek-harness
 ```
 
-## 验证
+脚本只读取补丁、覆盖层和目标 Git checkout，不会应用或反向应用补丁，也不会改写任何文件。它要求目标 HEAD 精确等于支持 commit；其他 commit 会退出 `1`，不能把补丁碰巧可应用视为通过验证，必须先移植、测试并重新生成补丁。脚本还验证补丁 SHA256、精确 12 文件 manifest、源文件 diff section 和覆盖层精确值，然后报告 `applicable` 或 `already-applied` 并打印五个聚焦测试文件与构建命令。
+
+验证补丁包全部交付文件的内容：
 
 ```bash
-PUBLIC_URL='https://harness.example.com:30499'
-
-# 首页
-curl -sS -o /dev/null -w '%{http_code}\n' "$PUBLIC_URL/"   # 200
-
-# 特权接口（正确 Origin）
-curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
-  -H 'Content-Type: application/json' \
-  -H "Origin: $PUBLIC_URL" -H 'Sec-Fetch-Site: same-origin' \
-  --data '{"type":"client-request","rpcId":"check","method":"settings.describe","payload":{}}' \
-  "$PUBLIC_URL/api/settings.describe"   # 200（不再是 403）
-
-# 错误 Origin 仍应 403（确认信任栅栏没被整体删除）
-curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
-  -H 'Content-Type: application/json' \
-  -H 'Origin: https://evil.example' -H 'Sec-Fetch-Site: same-origin' \
-  --data '{"type":"client-request","rpcId":"check","method":"host.describe","payload":{}}' \
-  "$PUBLIC_URL/api/host.describe"   # 403
+sha256sum -c SHA256SUMS
 ```
 
-WebSocket 路径（`/api/events.mux`、`/api/events.host`）走同一信任栅栏；反向代理或端口映射必须支持 WebSocket Upgrade。
+`SHA256SUMS` 覆盖除其自身和 `.git` 元数据外的全部最终文件。任何未来内容修改后都必须重新生成该清单。完整的 Linux 验证证据、版本、计数和 warning 处理策略见 [`docs/validation.md`](docs/validation.md)。
+
+## 运行时检查
+
+```bash
+PUBLIC_URL='https://PUBLIC_AUTHORITY'
+WRONG_ORIGIN='https://wrong-origin.invalid'
+
+# 首页应返回 200。
+curl -sS -o /dev/null -w '%{http_code}\n' "$PUBLIC_URL/"
+
+# 正确 Origin 调用 settings.describe 应返回 200。
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  -H 'Content-Type: application/json' \
+  -H "Origin: $PUBLIC_URL" \
+  -H 'Sec-Fetch-Site: same-origin' \
+  --data '{"type":"client-request","rpcId":"smoke","method":"settings.describe","payload":{}}' \
+  "$PUBLIC_URL/api/settings.describe"
+
+# 错误 Origin 必须继续返回 403。
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  -H 'Content-Type: application/json' \
+  -H "Origin: $WRONG_ORIGIN" \
+  -H 'Sec-Fetch-Site: cross-site' \
+  --data '{"type":"client-request","rpcId":"smoke","method":"settings.describe","payload":{}}' \
+  "$PUBLIC_URL/api/settings.describe"
+```
+
+已由 Host 插件注册的第三方设置命名空间会自动暴露，不需要在本仓库逐个列名；但本补丁不能凭空创建未注册的 Host 命名空间，也不会绕过命名空间 schema 或插件 validator。
+
+### 检查第三方命名空间
+
+将 `PLUGIN_NS` 设置为一个已由 Host 插件注册的第三方命名空间。下面的命令调用 `settings.describe`，并在响应中找不到该命名空间时以非零状态退出：
+
+```bash
+: "${PLUGIN_NS:?export PLUGIN_NS as a registered third-party namespace}"
+export PUBLIC_URL PLUGIN_NS
+
+SETTINGS_DESCRIBE=$(curl --fail-with-body -sS -X POST \
+  -H 'Content-Type: application/json' \
+  -H "Origin: $PUBLIC_URL" \
+  -H 'Sec-Fetch-Site: same-origin' \
+  --data '{"type":"client-request","rpcId":"namespace-check","method":"settings.describe","payload":{}}' \
+  "$PUBLIC_URL/api/settings.describe")
+export SETTINGS_DESCRIBE
+
+node <<'NODE'
+const response = JSON.parse(process.env.SETTINGS_DESCRIBE)
+if (response.result?.ok !== true) {
+  throw new Error(`settings.describe failed: ${JSON.stringify(response.result)}`)
+}
+const namespaces = response.result.value.namespaces ?? []
+if (!namespaces.some(view => view.ns === process.env.PLUGIN_NS)) {
+  throw new Error(`registered namespace not exposed: ${process.env.PLUGIN_NS}`)
+}
+console.log(`namespace exposed: ${process.env.PLUGIN_NS}`)
+NODE
+```
+
+### 保存并回读第三方设置
+
+`PATCH_JSON` 必须是所选命名空间 schema 接受的 JSON object。例如可先按目标插件文档执行 `export PATCH_JSON='{"theme":"dark"}'`；这只是通用 JSON object 示例，不表示每个插件都有 `theme` 字段，必须改成该插件真实、schema-valid 的字段和值。
+
+```bash
+: "${PATCH_JSON:?export PATCH_JSON as a schema-valid JSON object}"
+export PUBLIC_URL PLUGIN_NS PATCH_JSON
+
+UPDATE_REQUEST=$(node -e '
+const patch = JSON.parse(process.env.PATCH_JSON)
+process.stdout.write(JSON.stringify({
+  type: "client-request",
+  rpcId: "third-party-update",
+  method: "settings.update",
+  payload: { ns: process.env.PLUGIN_NS, patch },
+}))')
+
+UPDATE_RESPONSE=$(curl --fail-with-body -sS -X POST \
+  -H 'Content-Type: application/json' \
+  -H "Origin: $PUBLIC_URL" \
+  -H 'Sec-Fetch-Site: same-origin' \
+  --data "$UPDATE_REQUEST" \
+  "$PUBLIC_URL/api/settings.update")
+export UPDATE_RESPONSE
+
+node -e '
+const response = JSON.parse(process.env.UPDATE_RESPONSE)
+if (response.result?.ok !== true) throw new Error(`settings.update failed: ${JSON.stringify(response.result)}`)
+console.log(`setting saved: ${process.env.PLUGIN_NS}`)'
+
+READBACK_RESPONSE=$(curl --fail-with-body -sS -X POST \
+  -H 'Content-Type: application/json' \
+  -H "Origin: $PUBLIC_URL" \
+  -H 'Sec-Fetch-Site: same-origin' \
+  --data '{"type":"client-request","rpcId":"third-party-readback","method":"settings.describe","payload":{}}' \
+  "$PUBLIC_URL/api/settings.describe")
+export READBACK_RESPONSE
+
+node <<'NODE'
+const response = JSON.parse(process.env.READBACK_RESPONSE)
+if (response.result?.ok !== true) {
+  throw new Error(`settings.describe readback failed: ${JSON.stringify(response.result)}`)
+}
+const view = (response.result.value.namespaces ?? [])
+  .find(item => item.ns === process.env.PLUGIN_NS)
+if (!view) throw new Error(`namespace missing on readback: ${process.env.PLUGIN_NS}`)
+const patch = JSON.parse(process.env.PATCH_JSON)
+
+function deepEqual(actual, expected) {
+  if (Object.is(actual, expected)) return true
+  if (Array.isArray(actual) || Array.isArray(expected)) {
+    return Array.isArray(actual) && Array.isArray(expected)
+      && actual.length === expected.length
+      && actual.every((item, index) => deepEqual(item, expected[index]))
+  }
+  if (actual === null || expected === null
+    || typeof actual !== 'object' || typeof expected !== 'object') return false
+  const actualKeys = Object.keys(actual).sort()
+  const expectedKeys = Object.keys(expected).sort()
+  return actualKeys.length === expectedKeys.length
+    && actualKeys.every((key, index) => key === expectedKeys[index]
+      && deepEqual(actual[key], expected[key]))
+}
+
+for (const [key, expected] of Object.entries(patch)) {
+  if (!deepEqual(view.value?.[key], expected)) {
+    throw new Error(`readback mismatch for ${process.env.PLUGIN_NS}.${key}`)
+  }
+}
+console.log(`setting read back: ${process.env.PLUGIN_NS}`)
+NODE
+```
+
+### 检查 WebSocket
+
+以下命令使用 Node.js 22 内置 `WebSocket`，把 `PUBLIC_URL` 的 `http:`/`https:` 自动转换为 `ws:`/`wss:`。任一路径在 10 秒内未连接或发生错误，进程都会以非零状态退出：
+
+```bash
+export PUBLIC_URL
+
+node --input-type=module <<'NODE'
+const base = new URL(process.env.PUBLIC_URL)
+base.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:'
+
+function connect(path) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(path, base)
+    const socket = new WebSocket(url)
+    const timer = setTimeout(() => {
+      socket.close()
+      reject(new Error(`WebSocket timeout: ${url}`))
+    }, 10_000)
+    socket.addEventListener('open', () => {
+      clearTimeout(timer)
+      console.log(`WebSocket connected: ${url}`)
+      socket.close()
+      resolve()
+    }, { once: true })
+    socket.addEventListener('error', () => {
+      clearTimeout(timer)
+      reject(new Error(`WebSocket failed: ${url}`))
+    }, { once: true })
+  })
+}
+
+await connect('/api/events.mux')
+await connect('/api/events.host')
+NODE
+```
+
+## 进一步阅读
+
+- [架构](docs/architecture.md)
+- [安全](docs/security.md)
+- [故障排查](docs/troubleshooting.md)
+- [版本兼容性](docs/version-compatibility.md)
+- [验证证据](docs/validation.md)
