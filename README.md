@@ -68,6 +68,12 @@ allowRemoteSettingsPersistence
 
 前两个开关默认保持上游安全行为；第三个开关在客户端被本补丁显式默认开启，以解决 boot manifest 不透传配置的问题。
 
+## Shell 沙箱说明
+
+Shell 提示“沙箱后端不可用”或拒绝运行 `bash`，不属于本公网访问补丁处理的三层限制。Harness 在 Linux 上优先使用可工作的 Bubblewrap（`bwrap`），探测失败后回退到 Landlock；两者都不可用时会失败闭合，拒绝无沙箱执行命令。
+
+普通 Linux 服务器建议优先安装并验证 `bwrap`。容器环境可能因 user/mount namespace、AppArmor 或 capability 限制导致 `bwrap` 已安装但仍返回 `Operation not permitted`，这种情况下可使用 Harness 官方 Landlock 后端。源码 checkout 还可能需要先构建未纳入 Git 的平台 launcher。完整命令和判断方法见[故障排查：Shell 沙箱后端不可用](docs/troubleshooting.md#shell-沙箱后端不可用)。
+
 ## 支持版本
 
 当前补丁只支持 DeepSeek Harness commit：

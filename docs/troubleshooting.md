@@ -11,6 +11,7 @@
 | 插件卡片出现但一直 unavailable | `allowRemoteSettingsPersistence` 未启用，或浏览器缓存了旧客户端 bundle |
 | 保存请求到达服务端但被拒绝 | 命名空间 schema 或插件 validator 拒绝该值 |
 | 页面持续重连 | WebSocket upgrade、Host 转发或 Origin 转发错误 |
+| Shell 提示沙箱后端不可用、`bash` 被拒绝 | Linux 上 `bwrap` 和 Landlock 都未通过功能探测；这是本地沙箱问题，不是公网补丁问题 |
 
 ## 基础状态
 
@@ -72,6 +73,107 @@ HTTP `200` 不代表设置一定保存成功。检查 JSON 响应中的 `result.
 ## WebSocket 重连
 
 检查代理是否支持并转发 Upgrade/Connection 头，以及 `/api/events.mux`、`/api/events.host` 是否使用与页面相同的 Host 和 Origin。不要为修复重连而关闭外层可信请求栅栏。
+
+## Shell 沙箱后端不可用
+
+该错误来自 Harness 的本地进程沙箱，与 `trustedHosts`、特权 RPC、设置命名空间和远程设置持久化无关。Linux 后端按以下顺序进行功能探测：
+
+```text
+bwrap -> Landlock -> 拒绝无沙箱执行
+```
+
+Harness 会缓存本次插件生命周期内的 runner 选择。安装、移除或修复后端后必须重启 Harness，才能重新探测。
+
+### 优先配置 bwrap
+
+普通 Linux 服务器建议优先使用官方首选的 Bubblewrap：
+
+```bash
+apt-get update
+apt-get install -y bubblewrap
+
+bwrap \
+  --ro-bind / / \
+  --dev /dev \
+  --proc /proc \
+  --die-with-parent \
+  -- true
+```
+
+最后一条命令退出码为 `0` 时，Harness 可以选择 bwrap。按原部署方式停止并重新启动 `dsh web` 后生效。
+
+不要只用 `bwrap --version` 判断可用性；版本输出不能证明当前宿主允许它创建并配置实际沙箱。
+
+### bwrap 已安装但返回 Operation not permitted
+
+这通常是容器或宿主安全策略限制，不代表所有机器都无法使用 bwrap。常见限制包括：
+
+- 不允许 user namespace 内创建 mount namespace。
+- AppArmor、SELinux 或容器 runtime 拒绝挂载传播、bind mount、`/proc`、`/dev` 或 tmpfs 操作。
+- 容器 capability bounding set 不包含部署方式需要的能力。
+- Kubernetes `securityContext` 或宿主 sysctl 禁止相关 namespace 操作。
+
+可收集以下诊断信息：
+
+```bash
+unshare --user --map-root-user true
+unshare --user --map-root-user --mount true
+
+grep -E 'Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp' /proc/self/status
+cat /proc/self/attr/current 2>/dev/null || true
+sysctl kernel.unprivileged_userns_clone 2>/dev/null || true
+sysctl kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true
+```
+
+若单独 user namespace 成功、user + mount namespace 失败，需由宿主平台放行兼容的 namespace 与 LSM 策略。优先请求平台提供适用于 rootless bwrap 的 user/mount namespace 和 AppArmor/SELinux 配置；`CAP_SYS_ADMIN` 或 privileged 容器是权限更大的替代方案，不应作为默认建议。容器内部通常无法修改宿主只读 sysctl 或 LSM profile。
+
+### bwrap 不可用时使用 Landlock
+
+Landlock 是 Harness 官方 Linux 回退后端，不依赖 mount namespace。通过 npm 安装的 Harness 会随平台包提供 launcher；源码 checkout 中的 `packages/linux-<arch>/bin/landlock-run` 被 Git 忽略，可能需要本机编译：
+
+```bash
+apt-get update
+apt-get install -y musl-tools
+
+export PATH=/data/miniconda/envs/deepseek-harness/bin:$PATH
+pnpm --dir /data/deepseek-harness/native/landlock-run run build:native
+```
+
+验证 x64 launcher；arm64 将路径中的 `linux-x64` 改为 `linux-arm64`：
+
+```bash
+/data/deepseek-harness/native/landlock-run/packages/linux-x64/bin/landlock-run --probe
+```
+
+可接受结果：
+
+```text
+landlock: fully enforced
+```
+
+或：
+
+```text
+landlock: partially enforced (older ABI)
+```
+
+`partial` 表示较旧内核 ABI 只能约束其支持的访问类别，不表示沙箱未启用。`unusable`、非零退出码或 launcher 不存在表示该后端不可用。
+
+运行 Harness 自带的真实隔离测试：
+
+```bash
+cd /data/deepseek-harness
+
+pnpm exec vitest run --config vitest.e2e.config.ts \
+  packages/sandbox/sandbox-local/tests/landlock.e2e.ts
+
+pnpm exec vitest run --config vitest.e2e.config.ts \
+  packages/shell/bash-sandbox/tests/landlock.e2e.ts
+```
+
+修复后重启 Harness，使 `dsh-sandbox-local` 清除已缓存的 `unavailable` 结论。若自定义了 `TMPDIR`，还要确保它属于当前沙箱策略允许写入的路径；支持版本的 Linux workspace-write profile 默认放行 `/tmp` 和 workspace root。
+
+不要为绕过 `SANDBOX_UNAVAILABLE` 而把默认权限永久改成 `danger-full-access`。这会取消对应命令的沙箱保护，而不是修复后端。
 
 ## 测试与构建 warning
 
